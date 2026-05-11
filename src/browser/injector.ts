@@ -20,6 +20,56 @@ export interface DetectedFields {
   submitSelector: string | null;
 }
 
+/** Card-form autocomplete tokens we know how to fill. */
+export const CARD_TOKENS = [
+  "cc-number",
+  "cc-exp",
+  "cc-exp-month",
+  "cc-exp-year",
+  "cc-csc",
+  "cc-name",
+] as const;
+export type CardToken = (typeof CARD_TOKENS)[number];
+
+/** Identity-form autocomplete tokens we know how to fill. */
+export const IDENTITY_TOKENS = [
+  "given-name",
+  "family-name",
+  "name",
+  "email",
+  "tel",
+  "street-address",
+  "address-line1",
+  "address-line2",
+  "address-level1",
+  "address-level2",
+  "postal-code",
+  "country",
+  "country-name",
+  "bday",
+] as const;
+export type IdentityToken = (typeof IDENTITY_TOKENS)[number];
+
+export type DetectedTokenMap = Partial<Record<string, string>>;
+
+/** A normalized payload the injector consumes — `{ token: value }`. */
+export interface CardFillPayload {
+  number: string;
+  expMonth: string;
+  expYear: string;
+  cvc: string;
+  holderName: string;
+}
+
+/** Iframe selectors that indicate a hosted payment widget we don't support yet. */
+const IFRAME_PAYMENT_WIDGET_SELECTORS = [
+  'iframe[name^="__privateStripeFrame"]',
+  'iframe[src*="js.stripe.com"]',
+  'iframe[name*="adyen"]',
+  'iframe[src*="adyen.com"]',
+  'iframe[src*="braintreegateway.com"]',
+];
+
 /**
  * Abstract base class for browser injection backends.
  * Subclasses (AppleScriptInjector, CdpInjector) only need to implement
@@ -242,6 +292,230 @@ export abstract class Injector {
     }
 
     return this.submitAndWait(fields.submitSelector, fields.passwordSelector);
+  }
+
+  // ----- Card / Identity (PII) helpers -----
+
+  /**
+   * Detect a visible iframe payment widget (Stripe Elements, Adyen, Braintree).
+   * Returns the selector that matched, or null.
+   */
+  async detectIframePaymentWidget(): Promise<string | null> {
+    const sels = JSON.stringify(IFRAME_PAYMENT_WIDGET_SELECTORS);
+    const jsCode = `(function() {
+  var sels = ${sels};
+  for (var i = 0; i < sels.length; i++) {
+    var el = document.querySelector(sels[i]);
+    if (el) {
+      var s = window.getComputedStyle(el);
+      if (s.display !== 'none' && s.visibility !== 'hidden') return sels[i];
+    }
+  }
+  return null;
+})()`;
+    try {
+      const raw = await this.evaluate(jsCode);
+      const v = stripQuotes(raw);
+      return v === "null" || v === "" ? null : v;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Generic page-protocol check: returns "https" for https://, "localhost-http" for
+   * http://localhost or http://127.0.0.1, or "other" otherwise.
+   */
+  async getPageProtocol(): Promise<"https" | "localhost-http" | "other"> {
+    const jsCode = `(function() {
+  var p = window.location.protocol;
+  var h = window.location.hostname;
+  if (p === 'https:') return 'https';
+  if (p === 'http:' && (h === 'localhost' || h === '127.0.0.1' || h === '::1')) return 'localhost-http';
+  return 'other';
+})()`;
+    try {
+      const raw = await this.evaluate(jsCode);
+      const v = stripQuotes(raw);
+      if (v === "https" || v === "localhost-http") return v;
+      return "other";
+    } catch {
+      return "other";
+    }
+  }
+
+  /** Find a visible input with autocomplete=<token>, returning its CSS selector or null. */
+  protected async detectByAutocomplete(
+    tokens: readonly string[],
+  ): Promise<DetectedTokenMap> {
+    const list = JSON.stringify(tokens);
+    const jsCode = `(function() {
+  var tokens = ${list};
+  function isVisible(el) {
+    var s = window.getComputedStyle(el);
+    return s.display !== 'none' && s.visibility !== 'hidden' &&
+           s.opacity !== '0' && el.offsetWidth > 0 && el.offsetHeight > 0;
+  }
+  function selectorFor(el) {
+    if (el.id) return '#' + CSS.escape(el.id);
+    var ac = el.getAttribute('autocomplete');
+    if (ac) return 'input[autocomplete="' + ac + '"]';
+    if (el.name) return 'input[name="' + el.name + '"]';
+    return null;
+  }
+  var out = {};
+  tokens.forEach(function(tok) {
+    var nodes = document.querySelectorAll(
+      'input[autocomplete~="' + tok + '"], input[autocomplete*="' + tok + '"], select[autocomplete~="' + tok + '"]'
+    );
+    for (var i = 0; i < nodes.length; i++) {
+      if (isVisible(nodes[i])) {
+        var sel = selectorFor(nodes[i]);
+        if (sel) { out[tok] = sel; break; }
+      }
+    }
+  });
+  return JSON.stringify(out);
+})()`;
+    try {
+      const raw = await this.evaluate(jsCode);
+      return JSON.parse(stripQuotes(raw)) as DetectedTokenMap;
+    } catch {
+      return {};
+    }
+  }
+
+  async detectCardFields(): Promise<DetectedTokenMap> {
+    return this.detectByAutocomplete(CARD_TOKENS);
+  }
+
+  async detectIdentityFields(): Promise<DetectedTokenMap> {
+    return this.detectByAutocomplete(IDENTITY_TOKENS);
+  }
+
+  /**
+   * Apply viewport-only masking on `cc-number` and `cc-csc` inputs:
+   *   - style.webkitTextSecurity = "disc"   (rendered as dots; input.value unchanged)
+   *   - element.blur()                       (kill autocomplete dropdown, lose focus salience)
+   *
+   * Vision-only mitigation. Does NOT defend against DOM reads (`input.value`
+   * still returns the PAN). See docs/threat-model.md.
+   */
+  protected async maskCardFields(
+    selectors: { ccNumber?: string; ccCsc?: string },
+  ): Promise<void> {
+    const targets = [selectors.ccNumber, selectors.ccCsc].filter(
+      (s): s is string => Boolean(s),
+    );
+    if (targets.length === 0) return;
+    const sels = JSON.stringify(targets);
+    const jsCode = `(function() {
+  var sels = ${sels};
+  sels.forEach(function(s) {
+    var el = document.querySelector(s);
+    if (!el) return;
+    try { el.style.webkitTextSecurity = 'disc'; } catch (e) {}
+    try { el.style.textSecurity = 'disc'; } catch (e) {}
+    try { el.blur(); } catch (e) {}
+  });
+  try { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); } catch (e) {}
+  return 'ok';
+})()`;
+    try {
+      await this.evaluate(jsCode);
+    } catch {
+      // Best-effort. A failed mask doesn't break the fill.
+    }
+  }
+
+  /**
+   * Fill a card payment form. Detects fields by autocomplete token, fills what's
+   * present. Does NOT submit — checkout flows are multi-step. Returns the list
+   * of autocomplete tokens that were filled.
+   */
+  async fillCard(
+    data: CardFillPayload,
+  ): Promise<FillResult & { fieldsFilled?: string[] }> {
+    const detected = await this.detectCardFields();
+    const filled: string[] = [];
+
+    if (detected["cc-number"]) {
+      const r = await this.fillField(detected["cc-number"], data.number);
+      if (r.status === "error") return r;
+      filled.push("cc-number");
+    }
+    if (detected["cc-name"]) {
+      const r = await this.fillField(detected["cc-name"], data.holderName);
+      if (r.status === "error") return r;
+      filled.push("cc-name");
+    }
+    // Expiry: prefer combined cc-exp; fall back to split month/year.
+    if (detected["cc-exp"]) {
+      // Default to MM/YY; if the input's maxlength suggests MM/YYYY, send that.
+      const value = `${data.expMonth}/${data.expYear.slice(-2)}`;
+      const r = await this.fillField(detected["cc-exp"], value);
+      if (r.status === "error") return r;
+      filled.push("cc-exp");
+    } else {
+      if (detected["cc-exp-month"]) {
+        const r = await this.fillField(detected["cc-exp-month"], data.expMonth);
+        if (r.status === "error") return r;
+        filled.push("cc-exp-month");
+      }
+      if (detected["cc-exp-year"]) {
+        const r = await this.fillField(detected["cc-exp-year"], data.expYear);
+        if (r.status === "error") return r;
+        filled.push("cc-exp-year");
+      }
+    }
+    if (detected["cc-csc"]) {
+      const r = await this.fillField(detected["cc-csc"], data.cvc);
+      if (r.status === "error") return r;
+      filled.push("cc-csc");
+    }
+
+    if (filled.length === 0) {
+      return {
+        status: "error",
+        reason: "No card fields detected on the page (autocomplete cc-* tokens)",
+      };
+    }
+
+    await this.maskCardFields({
+      ccNumber: detected["cc-number"],
+      ccCsc: detected["cc-csc"],
+    });
+
+    return { status: "success", fieldsFilled: filled };
+  }
+
+  /**
+   * Fill an identity (name/email/phone/address) form. Detects fields by
+   * autocomplete token, fills what's present AND for which we have a value.
+   * Does NOT submit.
+   */
+  async fillIdentity(
+    data: Partial<Record<IdentityToken, string>>,
+  ): Promise<FillResult & { fieldsFilled?: string[] }> {
+    const detected = await this.detectIdentityFields();
+    const filled: string[] = [];
+
+    for (const token of IDENTITY_TOKENS) {
+      const selector = detected[token];
+      const value = data[token];
+      if (!selector || !value) continue;
+      const r = await this.fillField(selector, value);
+      if (r.status === "error") return r;
+      filled.push(token);
+    }
+
+    if (filled.length === 0) {
+      return {
+        status: "error",
+        reason: "No identity fields detected on the page (autocomplete tokens)",
+      };
+    }
+    return { status: "success", fieldsFilled: filled };
   }
 
   /**
