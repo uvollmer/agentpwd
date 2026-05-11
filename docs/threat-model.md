@@ -161,3 +161,63 @@ v2.x is gated on traction signal from the v1 OSS launch. Order of work when we s
 - AgentPwd does not (yet) protect against a remote browser provider (Browserbase, Anchor) being compromised. Once you pass them a `cdp_url`, the password is rendered into the form on their infrastructure. Their security is your security for that operation.
 
 If you find a case we should add to this list, file an issue.
+
+---
+
+## PII and credit card support
+
+v1 extends the same "fill, never reveal" invariant to two new entity types — **cards** (PAN, expiry, CVC, holder name) and **identities** (name, email, phone, address). Same threat model as login credentials at rest (AES-256-GCM, master key in OS keychain, audit-logged decryption). The interesting differences are at fill time.
+
+### Anti-phishing for non-login fills
+
+`domainMatches()` binds a login credential to one site and refuses fills elsewhere. Cards and identities aren't site-bound — you use a card on many merchants. v1 uses a different two-layer check instead (`checkPiiFillSafety` in `src/mcp/tools.ts`):
+
+1. **HTTPS required.** The current page must be `https://` (or `http://localhost` / `127.0.0.1` for dev). Refused otherwise. Stops trivial network exfiltration of the injected value.
+
+2. **Form-shape detection.** The page must already expose visible inputs with the relevant `autocomplete` tokens for the entity type:
+   - For cards: at least one of `cc-number`, `cc-exp`, `cc-csc`, `cc-name`, etc.
+   - For identities: at least one of `email`, `tel`, `name`, `given-name`, `street-address`, `postal-code`, etc.
+   - Hosted iframe payment widgets (Stripe Elements, Adyen, Braintree) are explicitly refused — they live on a cross-origin iframe and require CDP target-attach to fill, which is deferred.
+
+**Residual risk** v1 does NOT close: an agent-controlled HTTPS page that mimics a real checkout form (correct autocomplete tokens on visible inputs) can trigger a card fill. This is the analog of "phishing on a look-alike domain" for non-site-bound entities. Closing it requires a policy layer: per-card domain allowlists, spend caps, user-presence prompts, or virtual-card-provider integration. Out of scope for v1.
+
+### Filled-card exposure window (different from passwords)
+
+The login exposure window is closed by `Page.frameNavigated` blocking after submit. Card and identity fills behave differently:
+
+- **No auto-submit.** Checkout is multi-step (shipping → payment → review → confirm). `ap_fill_card` and `ap_fill_identity` fill and return; they do NOT click submit. The values sit in `input.value` until the agent advances the page.
+- **The window is bounded by the agent's next move.** When the agent clicks "Continue" or "Place order", the page navigates and the values go with it. In practice this is a few seconds.
+- **DOM read is the threat, not vision (for passwords).** Same as the login case (§ Filled-credential exposure window): any agent with code execution can read `input.value` regardless of what it's rendered as.
+
+### Vision-only mitigation for card numbers
+
+Cards expose a class of threat that passwords don't:
+
+- `<input type="password">` renders as `••••••••` → vision agents see dots, not the password.
+- Card-number fields are typically `<input type="text"|"tel">` → vision agents see the **full PAN** in a screenshot.
+
+After `ap_fill_card` injects values, the injector applies two viewport-only modifications to the `cc-number` and `cc-csc` inputs:
+
+```javascript
+element.style.webkitTextSecurity = "disc";  // viewport renders dots
+element.blur();                              // kill focus + autocomplete dropdown
+```
+
+The page reads `input.value` normally — form validation and submission are unaffected. Vision agents that take screenshots see dots.
+
+**This is not a boundary.** A DOM-read attack still wins (`document.querySelector('[autocomplete="cc-number"]').value` returns the PAN). Same fundamental limit as the discarded blur-at-fill approaches (§ Techniques considered and discarded). The CSS masking is documented as a vision-only mitigation precisely so callers don't overestimate it.
+
+Identity fields (`email`, `name`, `street-address`) are NOT masked. Two reasons: (a) a human reviewing the checkout wants to see them ("yes, that's my address"), (b) masked email looks like a typo and may cause false-positive correction by the user.
+
+### Card creation surface
+
+`ap_create_card` is **not** exposed as an MCP tool. Cards are CLI-only at creation (`ap add-card`, interactive hidden inputs). Reason: a PAN typed into agent chat enters the LLM context. For `ap_create_credential` the trade-off is acceptable (the password could be auto-generated, or the user is opting in to a known-leaky write); for a card it isn't — there's no auto-generated equivalent and the PAN is high-value.
+
+The proper agent-facing card creation flow is `ap_request_card`: the agent calls a tool, gets back a one-time HTTPS share link, the user opens it and types the card details into a zero-knowledge form (client-side Web Crypto), and AgentPwd receives ciphertext. This lands with the same share-link infrastructure already on the v1 roadmap (currently being built for password requests). It's the same shape as `op` doesn't ship a "give me your card" CLI flow either — the secret travels out-of-band from the agent's conversation.
+
+### What v1 does NOT claim for PII
+
+- Anti-phishing on a domain-agnostic entity (cards, identities) is fundamentally weaker than the per-site check for logins. v1's HTTPS+form-shape gate stops accidents and unsophisticated attackers, not a determined adversary who serves a convincing checkout-shaped page.
+- Hosted iframe payment widgets (Stripe Elements, Adyen, Braintree) are unsupported — the tool refuses with a clear error. Agents are expected to use raw card forms (rare on consumer e-commerce, common on B2B).
+- The viewport masking on cc-number / cc-csc is vision-only and does not protect against DOM-read attacks.
+- A locally-compromised agent (Bash access) can decrypt the cards/identities table directly via the same path described in §"the agent-with-shell-access problem". The hosted-vault v2 plan closes this for cards and identities just as it does for passwords.
