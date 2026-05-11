@@ -1,5 +1,5 @@
 import CDP from "chrome-remote-interface";
-import { Injector } from "./injector.js";
+import { Injector, type WaitForNavigationOptions } from "./injector.js";
 
 /**
  * CDP-based injector. Speaks Chrome DevTools Protocol over WebSocket.
@@ -106,6 +106,57 @@ export class CdpInjector extends Injector {
     } catch {
       // Connection may already be closed; nothing to do.
     }
+  }
+
+  /**
+   * Override the base polling implementation with a Page.frameNavigated
+   * subscription. Tighter timing (no 250ms poll latency) and works correctly
+   * during connection teardown of the previous page.
+   */
+  override async waitForNavigation(
+    opts: WaitForNavigationOptions = {},
+  ): Promise<boolean> {
+    const timeoutMs = opts.timeoutMs ?? 5000;
+
+    try {
+      if (this.sessionId) {
+        await this.client.send("Page.enable", undefined, this.sessionId);
+      } else {
+        await this.client.Page.enable();
+      }
+    } catch {
+      // If we can't enable Page (e.g. session torn down), the page has
+      // almost certainly navigated already.
+      return true;
+    }
+
+    return new Promise((resolve) => {
+      let resolved = false;
+      const settle = (value: boolean) => {
+        if (resolved) return;
+        resolved = true;
+        resolve(value);
+      };
+
+      this.client.on(
+        "Page.frameNavigated",
+        (
+          params: { frame: { parentId?: string } },
+          eventSessionId?: string,
+        ) => {
+          if (this.sessionId && eventSessionId !== this.sessionId) return;
+          // Only top-level frame navigations close the exposure window;
+          // sub-frame navigations don't tear down the parent's password form.
+          if (params.frame.parentId) return;
+          settle(true);
+        },
+      );
+
+      // The listener stays attached for the lifetime of this client. That's
+      // fine — each CdpInjector is single-use and closed after the fill,
+      // taking its EventEmitter with it.
+      setTimeout(() => settle(false), timeoutMs);
+    });
   }
 }
 

@@ -326,10 +326,17 @@ export function registerTools(server: McpServer): void {
     "ap_fill_field",
     {
       description:
-        "Fill a specific field (username or password) into a DOM element by " +
+        "Fill ONE specific field (username or password) into a DOM element by " +
         "CSS selector. Pre-fill validates that the page's domain matches the " +
-        "credential's site. Works with local Chrome and any CDP-compatible " +
-        "remote browser.",
+        "credential's site.\n\n" +
+        "PREFER `ap_fill_login` over this whenever the page has a recognisable " +
+        "login form — `ap_fill_login` auto-detects the fields, fills both, " +
+        "submits, and blocks until the page navigates. This tool does NOT " +
+        "submit; the password sits in the DOM (`input.value`) until your " +
+        "code submits the form elsewhere, which is a longer exposure window. " +
+        "Use this only when auto-detection in `ap_fill_login` fails or when " +
+        "the site separates username and password across pages with custom " +
+        "logic that needs explicit selectors.",
       inputSchema: {
         credential_id: z.string().describe("ID of the credential"),
         field: z

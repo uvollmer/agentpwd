@@ -80,19 +80,15 @@ We looked at several "blur the value at fill time" approaches. Most don't surviv
 | Chrome native autofill API | `chrome.autofillPrivate` is only exposed to internal Chrome components, not user code. `navigator.credentials.get()` returns the password to JS — same problem. |
 | Encoding/obfuscation at fill | We have to decode for submission; decoder runs in the page; agent reads the decoded value. |
 
-### Planned improvements (not implemented in v1)
+### Mitigations shipped
 
-Real improvements that don't add security theater. Tracked, not yet shipped:
+1. **Block on navigation in `ap_fill_login`** — after clicking submit, the MCP tool blocks until the top-level frame navigates (CDP: `Page.frameNavigated` subscription; AppleScript: poll `window.location.href`) or a 5s timeout elapses. The agent cannot inspect the filled-but-not-submitted state because it's blocked waiting for our response. This shrinks the `ap_fill_login` exposure window to effectively zero on the happy path.
 
-1. **Block on navigation in `ap_fill_login`** — after clicking submit, subscribe to `Page.frameNavigated` (CDP) or poll `window.location.href` (AppleScript). Don't return from the MCP tool until the form is gone. The agent can't inspect the filled-but-not-submitted state because it's blocked waiting for our response. **Biggest single improvement available; shrinks the exposure window to effectively zero for `ap_fill_login`.**
+2. **Best-effort clear-after-timeout** — if no navigation fires within the timeout (login failed, SPA without URL change, slow server), the password field's `input.value` is set to `""` as cleanup. The submission already either fired or didn't; clearing post-hoc just removes the lingering DOM artifact for an agent that might read it.
 
-2. **Best-effort clear-after-timeout** — if navigation doesn't fire within ~5s (login failed, SPA without URL change), set `input.value = ""` on the password field as cleanup. The submission already either fired or didn't; clearing post-hoc just removes the lingering DOM artifact.
+3. **Stronger tool description on `ap_fill_field`** — the description now explicitly steers callers toward `ap_fill_login` whenever the page has a recognisable login form, and calls out that `ap_fill_field` does NOT submit (so the password persists in `input.value` until external submit). LLMs reliably follow tool descriptions, so this is a real mitigation, not a hint.
 
-3. **Stronger tool description on `ap_fill_field`** — explicitly steer the LLM toward `ap_fill_login` whenever auto-detection works. LLMs reliably follow tool descriptions, so this is a real mitigation, not a hint.
-
-4. **Submission status from `ap_fill_login`** — return `{status: "submitted"}` vs `{status: "filled_not_submitted"}` based on whether navigation observed. The caller can react (clear the field, navigate away, etc.) instead of assuming success.
-
-These are tracked for a follow-up PR. None require breaking changes to the current MCP tool surface.
+4. **Submission status surfaced** — `ap_fill_login` returns `{status, navigated}` where `navigated: true` means the page transitioned (safe outcome) and `navigated: false` means submit was clicked but the page didn't navigate (caller should treat as "may have failed", DOM was best-effort cleared). The caller can react instead of assuming success.
 
 ### What does NOT improve security materially
 
