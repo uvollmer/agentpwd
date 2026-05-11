@@ -1,6 +1,17 @@
 export interface FillResult {
   status: "success" | "error";
   reason?: string;
+  /**
+   * For login flows: did the page navigate after submit?
+   * - `true` — the form submitted, navigation observed; the filled DOM
+   *   is gone. This is the safe outcome.
+   * - `false` — submit was clicked but no navigation observed within the
+   *   timeout (login failed, SPA without URL change, slow server). The
+   *   caller should treat this as "submission may not have succeeded" and
+   *   the password field may have been best-effort cleared post-hoc.
+   * - `undefined` — this fill didn't involve a submit (e.g. fillField).
+   */
+  navigated?: boolean;
 }
 
 export interface DetectedFields {
@@ -15,9 +26,51 @@ export interface DetectedFields {
  * `evaluate()` and `close()`. The high-level methods (fillField, fillLogin,
  * detectLoginFields, getCurrentUrl) are transport-agnostic and live here.
  */
+export interface WaitForNavigationOptions {
+  /** Max time to wait, in ms. Defaults to 5000. */
+  timeoutMs?: number;
+}
+
 export abstract class Injector {
   abstract evaluate(jsCode: string): Promise<string>;
   abstract close(): Promise<void>;
+
+  /**
+   * Block until the page navigates (top-level URL changes) or the timeout
+   * elapses. Default implementation polls window.location.href every 250ms.
+   * CDP overrides this with a Page.frameNavigated subscription for tighter
+   * timing. Returns true if navigation observed within timeout, false if
+   * the timeout elapsed first.
+   *
+   * Used by fillLogin() after clicking submit so the MCP tool doesn't
+   * return until the filled DOM is gone — closes the post-fill exposure
+   * window for an agent that might read input.value before navigation
+   * completes.
+   */
+  async waitForNavigation(opts: WaitForNavigationOptions = {}): Promise<boolean> {
+    const timeoutMs = opts.timeoutMs ?? 5000;
+    const start = Date.now();
+    let initialUrl: string;
+    try {
+      initialUrl = await this.getCurrentUrl();
+    } catch {
+      // If we can't read the URL, the page may already be transitioning;
+      // treat that as a navigation signal.
+      return true;
+    }
+    while (Date.now() - start < timeoutMs) {
+      await new Promise((r) => setTimeout(r, 250));
+      try {
+        const url = await this.getCurrentUrl();
+        if (url !== initialUrl) return true;
+      } catch {
+        // Connection in transition — likely a navigation tearing the
+        // previous page down. Treat as success.
+        return true;
+      }
+    }
+    return false;
+  }
 
   async getCurrentUrl(): Promise<string> {
     const raw = await this.evaluate("window.location.href");
@@ -165,10 +218,7 @@ export abstract class Injector {
             password,
           );
           if (passRes.status === "error") return passRes;
-          if (newFields.submitSelector) {
-            await this.clickElement(newFields.submitSelector);
-          }
-          return { status: "success" };
+          return this.submitAndWait(newFields.submitSelector, newFields.passwordSelector);
         }
         return {
           status: "error",
@@ -191,11 +241,38 @@ export abstract class Injector {
       if (res.status === "error") return res;
     }
 
-    if (fields.submitSelector) {
-      await this.clickElement(fields.submitSelector);
-    }
+    return this.submitAndWait(fields.submitSelector, fields.passwordSelector);
+  }
 
-    return { status: "success" };
+  /**
+   * Click the submit button (if found) and block until the page navigates,
+   * to close the post-fill DOM exposure window. If no navigation happens
+   * within the timeout (login failed, SPA without URL change, slow server),
+   * best-effort clear the password field so the cleartext isn't sitting in
+   * input.value waiting for an agent to read it.
+   */
+  private async submitAndWait(
+    submitSelector: string | null,
+    passwordSelector: string | null,
+  ): Promise<FillResult> {
+    if (!submitSelector) {
+      // No submit button found — caller will need to submit elsewhere. We
+      // can't wait for a navigation we didn't trigger.
+      return { status: "success", navigated: false };
+    }
+    await this.clickElement(submitSelector);
+    const navigated = await this.waitForNavigation();
+    if (!navigated && passwordSelector) {
+      // Best-effort cleanup: form submission already either fired or didn't.
+      // Clear the password field so its value isn't lingering for an agent
+      // that reads the DOM. Failure to clear isn't fatal.
+      try {
+        await this.fillField(passwordSelector, "");
+      } catch {
+        // ignore
+      }
+    }
+    return { status: "success", navigated };
   }
 }
 

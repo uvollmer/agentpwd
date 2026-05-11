@@ -183,4 +183,34 @@ describe.skipIf(!chromePath)("CdpInjector integration", () => {
     expect(fields.usernameSelector).toBeTruthy();
     expect(fields.submitSelector).toBeTruthy();
   });
+
+  it("waitForNavigation times out when nothing navigates", async () => {
+    if (!injector) return;
+    const start = Date.now();
+    const navigated = await injector.waitForNavigation({ timeoutMs: 500 });
+    const elapsed = Date.now() - start;
+    expect(navigated).toBe(false);
+    // Should NOT take much longer than the requested timeout
+    expect(elapsed).toBeLessThan(2000);
+  });
+
+  it("waitForNavigation resolves true when the top frame navigates", async () => {
+    if (!injector) return;
+    // Kick off the wait and the navigation concurrently. We navigate to
+    // about:blank (not another data: URL) because Chromium headless does NOT
+    // emit Page.frameNavigated for cross-data-URL navigations — empirically
+    // verified. about:blank is a reliable trigger.
+    const waitPromise = injector.waitForNavigation({ timeoutMs: 5000 });
+    setTimeout(() => {
+      injector!
+        .evaluate("window.location.assign('about:blank')")
+        .catch(() => {});
+    }, 100);
+
+    const navigated = await waitPromise;
+    expect(navigated).toBe(true);
+
+    // Give Chromium a moment to settle after the navigation
+    await new Promise((r) => setTimeout(r, 200));
+  }, 10000);
 });
