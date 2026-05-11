@@ -50,18 +50,64 @@ These don't *prevent* the attack — they raise the cost, slow it down, or detec
 
 5. **Claude Code hooks** *(documented, user-configured)* — `PreToolUse` hooks can block `Bash` commands matching `security find-generic-password`, `keytar`, or `agentpwd` patterns. Arms race (the agent can encode/obfuscate), but it adds a confirmation step. Example hook will ship in `hooks/` in a later PR.
 
-## v2 — remote vault solves this properly
+## Roadmap — closing the gap
 
-The architecturally correct fix is to **stop storing the master key on the agent's machine at all**. v2 will offer a hosted vault mode where:
+The architecturally correct fix is to **stop storing credentials on the agent's machine at all**. We're staging this in two cuts:
 
-- Credentials are stored as ciphertext on a remote server. The server **never** sees plaintext — it only holds opaque encrypted blobs.
-- The master key is derived (Argon2id) from a passphrase that lives **only in the user's head**. The local MCP daemon prompts for it once per session; the derived key lives in memory and is wiped on exit.
-- An agent that compromises the local machine and dumps `~/.agentpwd/` finds nothing decryptable. The keychain entry is gone. There's no master key on disk.
-- The agent can still call `ap_fill_login` to use credentials *during the session* — but it cannot exfiltrate them to use later, and it cannot survive a session reset.
+### v2.0 — hosted vault + remote browser only (the clean cut)
 
-This is the standard password manager architecture (Bitwarden, 1Password). It maps cleanly to the agent threat model because it removes the always-present master key from the attack surface entirely.
+```
+[Agent on local machine]
+   │ JSON-RPC over HTTPS + API key
+   │ ap_fill_login(credential_id="abc", cdp_url="wss://browserbase.com/...")
+   ▼
+[Hosted AgentPwd service]
+   - holds encrypted vault (we never see plaintext at rest; decrypted in process memory only)
+   - opens CDP WebSocket to cdp_url
+   - sends Runtime.evaluate with the password
+   ▼
+[Remote browser session (Browserbase / Anchor / Browserless / OpenClaw managed)]
+   - password is typed into the form
+```
 
-**Timeline:** v2 is gated on traction signal from the v1 OSS launch. If users are running into this limitation in practice, it accelerates.
+The agent receives `{status: "success"}`. **Its machine never touches the credential at any point** — no vault file, no master key, no in-flight plaintext. An agent with full shell access on its machine finds nothing decryptable because nothing came down. This is the same shape as a SaaS API; the credential ops are server-side.
+
+Residual risks at this tier:
+
+- **API key theft.** The agent's API key for the hosted service lives on the local machine. A compromised agent can steal it and call the service. But the API is shaped *fill, never reveal* — the worst the attacker can do with the token is trigger fills (visible) on domains that match the credential's site (enforced server-side via the same `domainMatches()` already in v1). They cannot extract plaintext.
+- **Operator trust.** You're trusting us to actually never log plaintext, etc. Same trust model as Bitwarden / 1Password operator tiers.
+- **Remote browser provider trust.** Browserbase/Anchor sees the value as part of the form rendering. Their security is your security for that operation. Same as v1.
+
+### v2.1 — hosted vault + Chrome extension (local browser support)
+
+For users who want to fill into their **own local Chrome** (Claude Code, Claude for Chrome, etc.), the hosted service can't reach `localhost` from the cloud. Two patterns exist:
+
+- A local daemon that opens an outbound WebSocket to the hosted service → tunnels credentials back to local Chrome via CDP. **This doesn't actually protect against a local agent**: the daemon runs as the user's account, holds plaintext in memory briefly, and any process running as that user can read its memory (`ptrace`, `/proc`, etc.) or hijack the localhost CDP socket. Same trust zone as the agent.
+- A **Chrome extension** as the bridge → meaningfully better. The extension lives *inside* Chrome:
+  - Chrome runs with hardened runtime + code signing on macOS, sandboxed renderers everywhere. `lldb -p` on Chrome fails without specific entitlements on mac; harder on Linux/Windows but still a higher bar than a standalone Node process.
+  - No CDP debug port exposed (the extension uses Chrome's internal `chrome.tabs` / content-script APIs, not the external CDP socket — so there's no localhost endpoint a sibling process can hijack).
+  - The extension's auth token to the hosted service is stored in `chrome.storage.local` (readable from disk by the user). An agent that steals it can call the hosted service — but the API is *fill, never reveal*, and domain validation server-side prevents fills on attacker-controlled pages. Worst case: attacker triggers visible fills on legitimate domains, which is loud and accomplishes little.
+
+```
+[Agent on local machine]  ──ap_fill_login + cdp_url=local──>  [Hosted service]
+                                                                      │
+                                                                      ▼
+[Local Chrome]  ◄──content script types into form──  [Our Chrome extension]
+                                                              ▲
+                                                              │  outbound WSS (TLS)
+                                                              │
+                                                       [Hosted service pushes fill commands]
+```
+
+Trade-offs of the extension: Chrome Web Store review cycle, manifest V3 service-worker constraints (offscreen documents / alarms workarounds), Chrome-family browsers only (no Firefox / Safari).
+
+### Why we're not doing passphrase-derived keys
+
+An earlier draft proposed deriving the master key from a passphrase the user enters per session. We dropped it: it still requires the plaintext key to live on the agent's machine *during the session* (so a co-resident agent can still extract it), and adds significant friction. The hosted model is both stronger (no credential ever reaches the local machine for remote-browser flows) and a cleaner product shape.
+
+### Timeline
+
+v2.x is gated on traction signal from the v1 OSS launch. Order of work when we start: v2.0 (hosted service + remote-browser flow) → v2.1 (Chrome extension for local browser). Self-hosted users stay on the v1 trust model.
 
 ## What we explicitly DO NOT claim
 
