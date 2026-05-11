@@ -1,0 +1,28 @@
+{
+  "name": "agentpwd",
+  "version": "0.0.1",
+  "description": "Credential management for AI agents — agents fill the form, never see the password.",
+  "type": "module",
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "npm run clean && tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/uvollmer/agentpwd"
+  },
+  "author": "uvollmer",
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.7"
+  }
+}
