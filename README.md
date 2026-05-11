@@ -110,6 +110,19 @@ The property-descriptor + `input`/`change` event dispatch logic is identical acr
 
 <br />
 
+# Agent integrations
+
+One-page recipes per target — concrete wiring, sample tool calls, target-specific caveats.
+
+- [**Claude Code**](docs/agents/claude-code.md) — `.mcp.json` setup, AppleScript vs CDP paths, optional hooks
+- [**Claude for Chrome**](docs/agents/claude-for-chrome.md) — running alongside Anthropic's extension on your local Chrome
+- [**OpenClaw**](docs/agents/openclaw.md) — pass their session endpoint as `cdp_url`
+- [**Browserbase**](docs/agents/browserbase.md) — pulling `connectUrl` from their session API
+- [**Anchor Browser**](docs/agents/anchor-browser.md) — same shape with their `cdp_url`
+- [**Hermes (Nous Research)**](docs/agents/hermes.md) — stub, help wanted
+
+<br />
+
 # Anti-phishing
 
 Before every fill, AgentPwd reads the page URL and matches its hostname against the credential's stored site. Mismatches are refused with an explicit error.
