@@ -183,56 +183,11 @@ program
     }
   });
 
-// --- show ---
-program
-  .command("show")
-  .description("Reveal a credential — interactive terminal only")
-  .requiredOption("--id <id>", "Credential ID")
-  .action(async (opts) => {
-    // Refuse to reveal in non-TTY contexts. This prevents an AI agent that
-    // can call Bash() from extracting plaintext via the CLI side channel —
-    // sanctioned access is the MCP layer's `ap_fill_login` (which never
-    // returns plaintext) or the agent passing through to a human.
-    if (!stdin.isTTY) {
-      console.error(
-        "Error: `ap show` requires an interactive terminal.\n" +
-          "This command cannot be run by AI agents or scripts.\n" +
-          "Agents should use the MCP tool `ap_fill_login` instead — it injects " +
-          "credentials into the browser without ever returning them.",
-      );
-      process.exit(1);
-    }
-
-    const store = openStore();
-    try {
-      const enc = store.getCredential(opts.id);
-      if (!enc) {
-        console.error("Credential not found.");
-        process.exit(1);
-      }
-
-      const key = await getMasterKey(enc.vaultId);
-      if (!key) {
-        console.error("Master key not found in OS keychain.");
-        process.exit(1);
-      }
-
-      const cred = store.decryptCredential(opts.id, key);
-      if (!cred) {
-        console.error("Failed to decrypt credential.");
-        process.exit(1);
-      }
-
-      console.log(`Site:     ${cred.site}`);
-      console.log(`Username: ${cred.username}`);
-      console.log(`Password: ${cred.password}`);
-      if (cred.totp) console.log(`TOTP:     ${cred.totp}`);
-      console.log(`Created:  ${cred.createdAt}`);
-      console.log(`Updated:  ${cred.updatedAt}`);
-    } finally {
-      store.close();
-    }
-  });
+// `ap show` is deliberately NOT included in v1. A TTY check is fake security
+// (trivially bypassable via `script -q`, pty.spawn, etc.) and a real
+// human-only reveal path requires hardware-attested user presence — deferred
+// to v2 (Touch ID / Windows Hello). For now there is no CLI command that
+// returns plaintext. See docs/threat-model.md.
 
 // --- delete ---
 program

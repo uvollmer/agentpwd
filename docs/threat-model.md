@@ -44,9 +44,9 @@ These don't *prevent* the attack — they raise the cost, slow it down, or detec
 
 2. **Audit log** — every `decryptCredential` call is recorded in `~/.agentpwd/vault.db` (timestamp, credential ID, action — never the value). `ap audit` shows it. Pattern: 100 reads in 10 seconds → something's off.
 
-3. **CLI lockdown** — `ap show` and `ap run` (CLI subcommands) refuse to run in non-TTY contexts. Agents can't `Bash("ap show --id ...")` to extract plaintext via the CLI side channel.
+3. **No plaintext reveal path in the CLI** — there is deliberately no `ap show` command in v1. A TTY check (`stdin.isTTY`) was considered and rejected: it's trivially bypassed by any agent that wraps the command in a pseudo-TTY (`script -q /dev/null ap show ...`, `python -c "pty.spawn(...)"`, `socat ... pty`, etc.) — so it would be fake security, worse than no protection because it advertises a guarantee it can't keep. A real human-only reveal path requires hardware-attested user presence (Touch ID / Windows Hello), which is deferred to v2.
 
-4. **Output scrubbing** — `ap_run` redacts the password and common encodings (base64/hex/URL-encoded/reversed) from stdout/stderr before returning to the LLM. Best-effort.
+4. **Output scrubbing** — `ap_run` (when it lands) redacts the password and common encodings (base64/hex/URL-encoded/reversed) from stdout/stderr before returning to the LLM. Best-effort, **not a boundary** — `ap_run` is a privileged escape hatch and any caller can defeat scrubbing with custom encoding.
 
 5. **Claude Code hooks** *(documented, user-configured)* — `PreToolUse` hooks can block `Bash` commands matching `security find-generic-password`, `keytar`, or `agentpwd` patterns. Arms race (the agent can encode/obfuscate), but it adds a confirmation step. Example hook will ship in `hooks/` in a later PR.
 
