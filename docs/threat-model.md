@@ -50,6 +50,55 @@ These don't *prevent* the attack — they raise the cost, slow it down, or detec
 
 5. **Claude Code hooks** *(documented, user-configured)* — `PreToolUse` hooks can block `Bash` commands matching `security find-generic-password`, `keytar`, or `agentpwd` patterns. Arms race (the agent can encode/obfuscate), but it adds a confirmation step. Example hook will ship in `hooks/` in a later PR.
 
+## Filled-credential exposure window
+
+Distinct threat from the keychain-extraction one above. After `ap_fill_login` or `ap_fill_field` injects a password into a form, the cleartext value lives — briefly — in three places:
+
+1. `<input>.value` on the DOM element (readable from page JS: `document.querySelector('#pw').value`)
+2. The accessibility tree (sometimes exposed to screen readers and CUI/computer-use models)
+3. The form submission's request body (legitimate, unavoidable — that's the point)
+
+**Pure vision is not the threat.** `<input type="password">` renders as `••••••••` in the viewport, so a vision model reading a screenshot of the page sees dots, not the password. Browser already protects this.
+
+**DOM / accessibility reads are the threat.** An agent with code execution (Bash, CDP, browser-side JS) can read the `value` property even though it renders as dots. The window of exposure varies by tool:
+
+| Tool | Exposure window |
+|---|---|
+| `ap_fill_login` | ~microseconds — fill + submit happen synchronously in one `Runtime.evaluate`; page typically navigates before the MCP call returns |
+| `ap_fill_field` | Indefinite — the value sits in `input.value` until the agent (or user) submits the form elsewhere. Real risk if the agent yields control before submitting. |
+
+### Techniques considered and discarded
+
+We looked at several "blur the value at fill time" approaches. Most don't survive contact with the threat:
+
+| Approach | Why it fails |
+|---|---|
+| Fill → submit → clear | Race condition: clearing before the form captures the value breaks the submission; clearing after still leaves a window for the agent. |
+| Decoy fields / haystack | The real password field is the only `type=password` with the right semantic attrs. Trivially filtered. |
+| Direct fetch/XHR to form action | Breaks CSRF rotation, MFA bridges, captcha-on-interaction, JS-driven login flows. Most modern sites stop working. |
+| Clipboard paste trick | The pasted value ends up in `.value` exactly like typing. Plus password lingers in the clipboard. |
+| Chrome native autofill API | `chrome.autofillPrivate` is only exposed to internal Chrome components, not user code. `navigator.credentials.get()` returns the password to JS — same problem. |
+| Encoding/obfuscation at fill | We have to decode for submission; decoder runs in the page; agent reads the decoded value. |
+
+### Planned improvements (not implemented in v1)
+
+Real improvements that don't add security theater. Tracked, not yet shipped:
+
+1. **Block on navigation in `ap_fill_login`** — after clicking submit, subscribe to `Page.frameNavigated` (CDP) or poll `window.location.href` (AppleScript). Don't return from the MCP tool until the form is gone. The agent can't inspect the filled-but-not-submitted state because it's blocked waiting for our response. **Biggest single improvement available; shrinks the exposure window to effectively zero for `ap_fill_login`.**
+
+2. **Best-effort clear-after-timeout** — if navigation doesn't fire within ~5s (login failed, SPA without URL change), set `input.value = ""` on the password field as cleanup. The submission already either fired or didn't; clearing post-hoc just removes the lingering DOM artifact.
+
+3. **Stronger tool description on `ap_fill_field`** — explicitly steer the LLM toward `ap_fill_login` whenever auto-detection works. LLMs reliably follow tool descriptions, so this is a real mitigation, not a hint.
+
+4. **Submission status from `ap_fill_login`** — return `{status: "submitted"}` vs `{status: "filled_not_submitted"}` based on whether navigation observed. The caller can react (clear the field, navigate away, etc.) instead of assuming success.
+
+These are tracked for a follow-up PR. None require breaking changes to the current MCP tool surface.
+
+### What does NOT improve security materially
+
+- **A Chrome extension at v1**: same trust boundary on the page. Even with isolated worlds for extension JS, the `input.value` it sets is still readable from page JS. The extension wins on cross-platform / no-debug-port-required, not on credential-leak protection.
+- **Encrypted/obfuscated value at fill**: pure security theater. The page receives the cleartext at the moment of decode, which is the moment that matters.
+
 ## Roadmap — closing the gap
 
 The architecturally correct fix is to **stop storing credentials on the agent's machine at all**. We're staging this in two cuts:

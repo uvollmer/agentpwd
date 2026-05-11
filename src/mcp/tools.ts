@@ -5,6 +5,70 @@ import { join } from "node:path";
 import { mkdirSync, existsSync, chmodSync } from "node:fs";
 import { VaultStore } from "../vault/store.js";
 import { getOrCreateMasterKey, getMasterKey } from "../vault/keychain.js";
+import {
+  getInjector,
+  domainMatches,
+  type Injector,
+} from "../browser/index.js";
+import { generateTOTP, decodeBase32 } from "../vault/totp.js";
+
+const CDP_URL_DESCRIPTION =
+  "Optional CDP (Chrome DevTools Protocol) endpoint. " +
+  "Pass for remote/managed browsers: Browserbase connectUrl, Anchor cdp_url, " +
+  "OpenClaw session endpoint, or any ws(s):// URL. " +
+  "If omitted, falls back to localhost:9222 (Chrome --remote-debugging-port) " +
+  "if reachable, otherwise AppleScript on macOS.";
+
+/**
+ * Acquire an Injector for a fill operation and run `body` with it.
+ * Always closes the injector afterward — CDP holds a WebSocket that must
+ * be released to avoid leaking connections.
+ */
+async function withInjector<T>(
+  cdpUrl: string | undefined,
+  body: (injector: Injector) => Promise<T>,
+): Promise<T> {
+  const injector = await getInjector({ cdpUrl });
+  try {
+    return await body(injector);
+  } finally {
+    await injector.close();
+  }
+}
+
+/**
+ * Verify the active page's URL matches the credential's site before any
+ * fill. Returns null on success, or an error message string on mismatch.
+ * Anti-phishing: stops the LLM from being tricked into filling a github
+ * credential on a github-look-alike domain.
+ */
+async function checkDomain(
+  injector: Injector,
+  credentialSite: string,
+): Promise<string | null> {
+  let currentUrl: string;
+  try {
+    currentUrl = await injector.getCurrentUrl();
+  } catch (err) {
+    return `Could not read current page URL: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  if (!currentUrl) {
+    return "Could not read current page URL (empty result)";
+  }
+  if (!domainMatches(currentUrl, credentialSite)) {
+    let host: string;
+    try {
+      host = new URL(currentUrl).hostname;
+    } catch {
+      host = currentUrl;
+    }
+    return (
+      `Domain mismatch: credential is for "${credentialSite}" but ` +
+      `current page is on "${host}". Refusing to fill.`
+    );
+  }
+  return null;
+}
 
 const AP_DIR = join(homedir(), ".agentpwd");
 const DB_PATH = join(AP_DIR, "vault.db");
@@ -198,6 +262,219 @@ export function registerTools(server: McpServer): void {
           return errorResult(`Credential "${credential_id}" not found`);
         }
         return textResult({ status: "deleted", credential_id });
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  // --- ap_fill_login ---
+  server.registerTool(
+    "ap_fill_login",
+    {
+      description:
+        "Fill a login form on the active browser page with the credential's " +
+        "username and password. Credentials are injected directly into the " +
+        "browser — never returned to the agent. Pre-fill validates that the " +
+        "page's domain matches the credential's site (anti-phishing). Works " +
+        "against local Chrome (AppleScript on macOS, or CDP via " +
+        "--remote-debugging-port) and any remote browser that exposes CDP " +
+        "(Browserbase, Anchor, Browserless, OpenClaw).",
+      inputSchema: {
+        credential_id: z.string().describe("ID of the credential to use"),
+        cdp_url: z.string().optional().describe(CDP_URL_DESCRIPTION),
+      },
+    },
+    async ({ credential_id, cdp_url }) => {
+      const store = getStore();
+      try {
+        const enc = store.getCredential(credential_id);
+        if (!enc) return errorResult(`Credential "${credential_id}" not found`);
+
+        const key = await getMasterKey(enc.vaultId);
+        if (!key) {
+          return errorResult(
+            `Master key for vault "${enc.vaultId}" not found in OS keychain`,
+          );
+        }
+
+        const cred = store.decryptCredential(credential_id, key);
+        if (!cred) return errorResult("Failed to decrypt credential");
+
+        try {
+          return await withInjector(cdp_url, async (injector) => {
+            const domainErr = await checkDomain(injector, cred.site);
+            if (domainErr) return errorResult(domainErr);
+            const result = await injector.fillLogin(cred.username, cred.password);
+            return textResult(result);
+          });
+        } catch (err) {
+          return errorResult(
+            err instanceof Error ? err.message : String(err),
+          );
+        }
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  // --- ap_fill_field ---
+  server.registerTool(
+    "ap_fill_field",
+    {
+      description:
+        "Fill a specific field (username or password) into a DOM element by " +
+        "CSS selector. Pre-fill validates that the page's domain matches the " +
+        "credential's site. Works with local Chrome and any CDP-compatible " +
+        "remote browser.",
+      inputSchema: {
+        credential_id: z.string().describe("ID of the credential"),
+        field: z
+          .enum(["username", "password"])
+          .describe("Which field to fill"),
+        css_selector: z
+          .string()
+          .describe("CSS selector for the target input element"),
+        cdp_url: z.string().optional().describe(CDP_URL_DESCRIPTION),
+      },
+    },
+    async ({ credential_id, field, css_selector, cdp_url }) => {
+      const store = getStore();
+      try {
+        const enc = store.getCredential(credential_id);
+        if (!enc) return errorResult(`Credential "${credential_id}" not found`);
+
+        const key = await getMasterKey(enc.vaultId);
+        if (!key) {
+          return errorResult(
+            `Master key for vault "${enc.vaultId}" not found in OS keychain`,
+          );
+        }
+
+        const cred = store.decryptCredential(credential_id, key);
+        if (!cred) return errorResult("Failed to decrypt credential");
+
+        const value = field === "username" ? cred.username : cred.password;
+        try {
+          return await withInjector(cdp_url, async (injector) => {
+            const domainErr = await checkDomain(injector, cred.site);
+            if (domainErr) return errorResult(domainErr);
+            const result = await injector.fillField(css_selector, value);
+            return textResult(result);
+          });
+        } catch (err) {
+          return errorResult(
+            err instanceof Error ? err.message : String(err),
+          );
+        }
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  // --- ap_set_totp ---
+  server.registerTool(
+    "ap_set_totp",
+    {
+      description:
+        "Store a TOTP seed on an existing credential. The seed is encrypted " +
+        "at rest. The seed value is never returned.",
+      inputSchema: {
+        credential_id: z.string().describe("ID of the credential"),
+        totp_seed: z
+          .string()
+          .describe(
+            "Base32-encoded TOTP secret (e.g. from a QR code setup key)",
+          ),
+      },
+    },
+    async ({ credential_id, totp_seed }) => {
+      const store = getStore();
+      try {
+        const enc = store.getCredential(credential_id);
+        if (!enc) return errorResult(`Credential "${credential_id}" not found`);
+
+        try {
+          decodeBase32(totp_seed);
+          generateTOTP(totp_seed);
+        } catch {
+          return errorResult(
+            "Invalid TOTP seed — must be a valid base32 string",
+          );
+        }
+
+        const key = await getMasterKey(enc.vaultId);
+        if (!key) {
+          return errorResult(
+            `Master key for vault "${enc.vaultId}" not found in OS keychain`,
+          );
+        }
+
+        store.setTotp(credential_id, key, totp_seed);
+        return textResult({ status: "ok", credential_id });
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  // --- ap_fill_totp ---
+  server.registerTool(
+    "ap_fill_totp",
+    {
+      description:
+        "Generate the current TOTP code from the credential's stored seed " +
+        "and inject it into the MFA input. The TOTP code is never returned " +
+        "to the agent. Pre-fill validates that the page's domain matches the " +
+        "credential's site.",
+      inputSchema: {
+        credential_id: z
+          .string()
+          .describe("ID of the credential with a TOTP seed"),
+        css_selector: z
+          .string()
+          .describe("CSS selector for the TOTP input element"),
+        cdp_url: z.string().optional().describe(CDP_URL_DESCRIPTION),
+      },
+    },
+    async ({ credential_id, css_selector, cdp_url }) => {
+      const store = getStore();
+      try {
+        const enc = store.getCredential(credential_id);
+        if (!enc) return errorResult(`Credential "${credential_id}" not found`);
+
+        const key = await getMasterKey(enc.vaultId);
+        if (!key) {
+          return errorResult(
+            `Master key for vault "${enc.vaultId}" not found in OS keychain`,
+          );
+        }
+
+        const cred = store.decryptCredential(credential_id, key);
+        if (!cred) return errorResult("Failed to decrypt credential");
+
+        if (!cred.totp) {
+          return errorResult(
+            `No TOTP seed stored for credential "${credential_id}". ` +
+              `Use ap_set_totp first.`,
+          );
+        }
+
+        const code = generateTOTP(cred.totp);
+        try {
+          return await withInjector(cdp_url, async (injector) => {
+            const domainErr = await checkDomain(injector, cred.site);
+            if (domainErr) return errorResult(domainErr);
+            const result = await injector.fillField(css_selector, code);
+            return textResult(result);
+          });
+        } catch (err) {
+          return errorResult(
+            err instanceof Error ? err.message : String(err),
+          );
+        }
       } finally {
         store.close();
       }
